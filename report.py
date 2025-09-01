@@ -1,426 +1,378 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import pandas as pd
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+# vision_report_training.py
 import os
-from transformers import GPT2Tokenizer
+import math
+import random
+from pathlib import Path
+from typing import List, Dict, Optional
 
-class IndianaXrayDataset(Dataset):
+import torch
+from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
+from torch.optim import AdamW
+from torchvision import transforms
+from PIL import Image
+import pandas as pd
+from tqdm import tqdm
+
+from transformers import (
+    ViTImageProcessor, AutoTokenizer,
+    VisionEncoderDecoderModel, get_scheduler
+)
+
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+CSV_PATH = "/Users/anishrajumapathy/Downloads/archive-4/indiana_reports.csv"        # path to your CSV
+IMAGES_DIR = "/Users/anishrajumapathy/Downloads/archive-4/images/images_normalized"        # folder with PNG images
+OUTPUT_DIR = "saved_report_model"       # where to save model & tokenizer
+IMPRESSION_COL = "impression"           # column name to use as target text
+UID_COL = "uid"                         # column with identifier to match images
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+# training
+BATCH_SIZE = 8
+EPOCHS = 20
+LR = 0.005
+WEIGHT_DECAY = 0.01
+WARMUP_STEPS = 100
+MAX_TARGET_LENGTH = 128   # max tokens for report
+MAX_PIXEL_VALUE = 1.0
+
+# generation settings
+GEN_MAX_LENGTH = 128
+NUM_BEAMS = 4
+
+# small debug overfit mode (set to True to quickly verify training correctness)
+DEBUG_OVERFIT = False
+OVERFIT_SIZE = 32
+
+
+# ---------------------------
+# Utilities: robust filename matching
+# ---------------------------
+def find_image_files_for_uid(images_dir: str, uid: str) -> List[str]:
     """
-    Dataset for Indiana X-ray images and reports
+    Return list of filenames in images_dir that contain uid as substring and end with .png
+    This is intentionally permissive to handle formatting differences.
     """
-    def __init__(self, reports_csv, images_dir, tokenizer, transform=None, max_length=256):
-        """
-        Args:
-            reports_csv: Path to indiana_reports.csv
-            images_dir: Path to images_normalized folder
-            tokenizer: Tokenizer for reports
-            transform: Image transforms
-            max_length: Maximum report length
-        """
-        # Load reports CSV
-        self.reports_df = pd.read_csv(reports_csv)
+    uid_str = str(uid)
+    matches = []
+    for fname in os.listdir(images_dir):
+        if not fname.lower().endswith(".png"):
+            continue
+        if uid_str in fname:
+            matches.append(os.path.join(images_dir, fname))
+    return matches
+
+
+# ---------------------------
+# Dataset
+# ---------------------------
+class IndianaReportDataset(Dataset):
+    def __init__(
+        self,
+        csv_path: str,
+        images_dir: str,
+        image_processor: ViTImageProcessor,
+        tokenizer,
+        uid_col: str = UID_COL,
+        text_col: str = IMPRESSION_COL,
+        max_target_length: int = MAX_TARGET_LENGTH,
+        transform=None,
+        require_image: bool = True
+    ):
+        self.df = pd.read_csv(csv_path)
+        # Drop rows missing impression
+        self.df = self.df.dropna(subset=[text_col])
         self.images_dir = images_dir
+        self.image_processor = image_processor
         self.tokenizer = tokenizer
+        self.text_col = text_col
+        self.uid_col = uid_col
+        self.max_target_length = max_target_length
         self.transform = transform
-        self.max_length = max_length
-        
-        # Clean and prepare data
-        self.prepare_data()
-    
-    def prepare_data(self):
-        """Clean and prepare the data"""
-        # Remove rows with empty findings/impressions
-        self.reports_df = self.reports_df.dropna(subset=['findings', 'impression'])
-        
-        # Combine findings and impression into one report
-        self.reports_df['full_report'] = (
-            "FINDINGS: " + self.reports_df['findings'].astype(str) + 
-            " IMPRESSION: " + self.reports_df['impression'].astype(str)
-        )
-        
-        # Filter to only include images that exist
-        valid_indices = []
-        for idx, row in self.reports_df.iterrows():
-            # Check if corresponding image exists
-            image_files = self.get_image_files(row['uid'])
-            if image_files:  # If at least one image exists
-                valid_indices.append(idx)
-        
-        self.reports_df = self.reports_df.loc[valid_indices].reset_index(drop=True)
-        print(f"Dataset size after filtering: {len(self.reports_df)}")
-    
-    def get_image_files(self, uid):
-        """Get image files for a given UID"""
-        # Images are named like: UID_IM-XXXX-XXXX.dcm.png
-        possible_files = []
-        for filename in os.listdir(self.images_dir):
-            if filename.startswith(str(uid)) and filename.endswith('.png'):
-                possible_files.append(filename)
-        return possible_files
-    
+
+        # Map rows -> first matched image (robust)
+        rows = []
+        for i, row in self.df.iterrows():
+            uid = row[uid_col]
+            matches = find_image_files_for_uid(images_dir, uid)
+            if len(matches) == 0:
+                # skip if no image found
+                continue
+            # prefer files that start with uid, else take first
+            chosen = None
+            for m in matches:
+                if os.path.basename(m).startswith(str(uid)):
+                    chosen = m
+                    break
+            if chosen is None:
+                chosen = matches[0]
+            rows.append({"img_path": chosen, "text": row[text_col], "uid": uid})
+
+        self.rows = pd.DataFrame(rows).reset_index(drop=True)
+        print(f"[DATA] total paired examples: {len(self.rows)}")
+
+        # Quick sanity prints
+        for i in range(min(5, len(self.rows))):
+            print(f"[DATA CHECK] idx={i} uid={self.rows.loc[i,'uid']} img={os.path.basename(self.rows.loc[i,'img_path'])} text_sample={self.rows.loc[i,'text'][:80]!r}")
+
     def __len__(self):
-        return len(self.reports_df)
-    
+        return len(self.rows)
+
     def __getitem__(self, idx):
-        row = self.reports_df.iloc[idx]
-        uid = row['uid']
-        report = row['full_report']
-        
-        # Get image files
-        image_files = self.get_image_files(uid)
-        
-        # Load first available image
-        image_path = os.path.join(self.images_dir, image_files[0])
-        image = Image.open(image_path).convert('RGB')
-        
+        row = self.rows.iloc[idx]
+        img_path = row["img_path"]
+        text = str(row["text"])
+
+        # Load image
+        image = Image.open(img_path).convert("RGB")
         if self.transform:
             image = self.transform(image)
-        
-        # Tokenize report
-        encoding = self.tokenizer(
-            report,
+
+        # Process image to model pixel_values
+        pixel_values = self.image_processor(images=image, return_tensors="pt").pixel_values.squeeze(0)  # (C,H,W)
+
+        # Tokenize text
+        tokens = self.tokenizer(
+            text,
             truncation=True,
-            max_length=self.max_length,
-            padding='max_length',
-            return_tensors='pt'
+            padding="max_length",
+            max_length=self.max_target_length,
+            return_tensors="pt",
         )
-        
+        input_ids = tokens.input_ids.squeeze(0)
+        attention_mask = tokens.attention_mask.squeeze(0)
+
+        # Replace pad token id with -100 for loss ignoring if using labels directly
+        labels = input_ids.clone()
+        labels[labels == self.tokenizer.pad_token_id] = -100
+
         return {
-            'image': image,
-            'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0),
-            'report_text': report
+            "pixel_values": pixel_values,
+            "labels": labels,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "uid": row["uid"]
         }
 
 
-class SimpleReportGenerator(nn.Module):
-    """
-    Simple model: CNN features + Regular Transformer for report generation
-    This is NOT a Vision Transformer - just your regular transformer!
-    """
-    def __init__(self, cnn_feature_dim=512, vocab_size=50257, max_length=256, 
-                 d_model=512, nhead=8, num_layers=6):
-        super().__init__()
-        
-        self.d_model = d_model
-        self.max_length = max_length
-        
-        # Project CNN features to transformer dimension
-        self.cnn_projection = nn.Linear(cnn_feature_dim, d_model)
-        
-        # Regular transformer components (like your GPT)
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.position_embedding = nn.Embedding(max_length, d_model)
-        
-        # Transformer decoder layers (just like your GPT!)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=4*d_model,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers)
-        
-        # Output projection to vocabulary
-        self.output_projection = nn.Linear(d_model, vocab_size)
-        
-        # Layer norm
-        self.ln_f = nn.LayerNorm(d_model)
-    
-    def forward(self, cnn_features, input_ids=None, generate_mode=False, max_new_tokens=100):
-        """
-        Forward pass
-        Args:
-            cnn_features: Features from CNN (batch_size, cnn_feature_dim)
-            input_ids: Token IDs for training (batch_size, seq_len)
-            generate_mode: Whether to generate text
-        """
-        batch_size = cnn_features.size(0)
-        device = cnn_features.device
-        
-        # Project CNN features to transformer dimension
-        visual_features = self.cnn_projection(cnn_features)  # (B, d_model)
-        visual_features = visual_features.unsqueeze(1)  # (B, 1, d_model)
-        
-        if generate_mode:
-            return self.generate_text(visual_features, max_new_tokens)
-        
-        # Training mode - teacher forcing
-        seq_len = input_ids.size(1)
-        
-        # Token embeddings
-        token_embeds = self.token_embedding(input_ids)  # (B, T, d_model)
-        
-        # Position embeddings
-        positions = torch.arange(seq_len, device=device).unsqueeze(0)
-        pos_embeds = self.position_embedding(positions)
-        
-        # Combine token and position embeddings
-        text_embeds = token_embeds + pos_embeds  # (B, T, d_model)
-        
-        # Create causal mask for autoregressive generation
-        tgt_mask = self.generate_square_subsequent_mask(seq_len).to(device)
-        
-        # Transformer decoder
-        # Memory = visual features, tgt = text embeddings
-        output = self.transformer_decoder(
-            tgt=text_embeds,
-            memory=visual_features,
-            tgt_mask=tgt_mask
-        )
-        
-        output = self.ln_f(output)
-        logits = self.output_projection(output)
-        
-        return logits
-    
-    def generate_text(self, visual_features, max_new_tokens):
-        """Generate text given visual features"""
-        batch_size = visual_features.size(0)
-        device = visual_features.device
-        
-        # Start with BOS token (assuming token ID 50256 is BOS for GPT-2)
-        generated = torch.full((batch_size, 1), 50256, device=device, dtype=torch.long)
-        
-        self.eval()
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                seq_len = generated.size(1)
-                
-                # Token and position embeddings
-                token_embeds = self.token_embedding(generated)
-                positions = torch.arange(seq_len, device=device).unsqueeze(0)
-                pos_embeds = self.position_embedding(positions)
-                text_embeds = token_embeds + pos_embeds
-                
-                # Causal mask
-                tgt_mask = self.generate_square_subsequent_mask(seq_len).to(device)
-                
-                # Forward pass
-                output = self.transformer_decoder(
-                    tgt=text_embeds,
-                    memory=visual_features,
-                    tgt_mask=tgt_mask
+# ---------------------------
+# Collate function
+# ---------------------------
+def collate_fn(batch):
+    pixel_values = torch.stack([b["pixel_values"] for b in batch])
+    labels = torch.stack([b["labels"] for b in batch])
+    input_ids = torch.stack([b["input_ids"] for b in batch])
+    attention_mask = torch.stack([b["attention_mask"] for b in batch])
+    uids = [b["uid"] for b in batch]
+    return {"pixel_values": pixel_values, "labels": labels, "input_ids": input_ids, "attention_mask": attention_mask, "uids": uids}
+
+
+# ---------------------------
+# Train / Eval / Generation functions
+# ---------------------------
+def train_loop(model, dataloader, optimizer, lr_scheduler, epoch, device):
+    model.train()
+    running_loss = 0.0
+    for step, batch in enumerate(tqdm(dataloader, desc=f"Train E{epoch}")):
+        pixel_values = batch["pixel_values"].to(device)
+        labels = batch["labels"].to(device)
+
+        outputs = model(pixel_values=pixel_values, labels=labels)
+        loss = outputs.loss
+
+        loss.backward()
+        optimizer.step()
+        if lr_scheduler:
+            lr_scheduler.step()
+        optimizer.zero_grad()
+
+        running_loss += loss.item()
+        if (step + 1) % 50 == 0:
+            avg = running_loss / (step + 1)
+            print(f"  step {step+1} loss {avg:.4f}")
+    return running_loss / (len(dataloader) + 1e-12)
+
+
+def eval_loop(model, dataloader, device, tokenizer, n_samples=10):
+    model.eval()
+    losses = []
+    examples = []
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Eval"):
+            pixel_values = batch["pixel_values"].to(device)
+            labels = batch["labels"].to(device)
+            outputs = model(pixel_values=pixel_values, labels=labels)
+            losses.append(outputs.loss.item())
+
+            # sample a handful for inspection
+            if len(examples) < n_samples:
+                gen = model.generate(
+                    pixel_values=pixel_values[:1].to(device),
+                    max_length=GEN_MAX_LENGTH,
+                    num_beams=NUM_BEAMS,
+                    early_stopping=True
                 )
-                
-                output = self.ln_f(output)
-                logits = self.output_projection(output)
-                
-                # Get last token probabilities
-                last_token_logits = logits[:, -1, :]
-                
-                # Sample next token (you can add temperature, top-k sampling here)
-                next_token = torch.multinomial(F.softmax(last_token_logits, dim=-1), 1)
-                
-                # Append to sequence
-                generated = torch.cat([generated, next_token], dim=1)
-                
-                # Check for EOS token (assuming 50256 is EOS)
-                if next_token.item() == 50256:
-                    break
-        
-        return generated
-    
-    def generate_square_subsequent_mask(self, sz):
-        """Generate causal mask"""
-        mask = torch.triu(torch.ones(sz, sz), diagonal=1)
-        return mask.masked_fill(mask == 1, float('-inf'))
+                decoded = tokenizer.decode(gen[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                examples.append((batch["uids"][0], decoded, tokenizer.decode(labels[0].masked_fill(labels[0]==-100, tokenizer.pad_token_id), skip_special_tokens=True)))
+
+    avg_loss = sum(losses) / (len(losses) + 1e-12)
+    return avg_loss, examples
 
 
-class CNNFeatureExtractor(nn.Module):
-    """
-    Extract features from your trained CNN
-    """
-    def __init__(self, trained_cnn_path=None):
-        super().__init__()
-        
-        if trained_cnn_path and os.path.exists(trained_cnn_path):
-            # Load your trained CNN
-            print(f"Loading trained CNN from {trained_cnn_path}")
-            checkpoint = torch.load(trained_cnn_path, map_location='cpu')
-            
-            # Create your CNN (you'll need to import your class here)
-            # For now, using a placeholder - replace with your actual CNN class
-            from your_cnn_file import MultiDiseaseConvolutionalNetwork
-            self.cnn = MultiDiseaseConvolutionalNetwork(num_classes=15)
-            self.cnn.load_state_dict(checkpoint['model_state_dict'])
-            
-            # Remove final classification layer to get features
-            # Modify based on your CNN architecture
-            self.feature_layers = nn.Sequential(*list(self.cnn.children())[:-1])
-            
-        else:
-            # Use a pre-trained ResNet as backup
-            print("Using pre-trained ResNet50 as feature extractor")
-            import torchvision.models as models
-            resnet = models.resnet50(pretrained=True)
-            self.feature_layers = nn.Sequential(*list(resnet.children())[:-1])
-        
-        # Global average pooling to get fixed-size features
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # Freeze CNN weights initially
-        for param in self.feature_layers.parameters():
-            param.requires_grad = False
-    
-    def forward(self, x):
-        features = self.feature_layers(x)
-        
-        # Handle different output shapes
-        if len(features.shape) > 2:
-            features = self.global_pool(features)
-            features = features.flatten(1)
-        
-        return features
+def generate_report_from_image(model, processor, tokenizer, image_path, device, num_beams=NUM_BEAMS, max_length=GEN_MAX_LENGTH):
+    model.eval()
+    image = Image.open(image_path).convert("RGB")
+    pixel_values = processor(images=image, return_tensors="pt").pixel_values.to(device)
+    with torch.no_grad():
+        output_ids = model.generate(pixel_values=pixel_values, num_beams=num_beams, max_length=max_length, early_stopping=True)
+    return tokenizer.decode(output_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
 
 
-def train_report_generator(
-    reports_csv_path,
-    images_dir,
-    cnn_model_path=None,
-    num_epochs=5,
-    batch_size=2,
-    learning_rate=1e-4
-):
-    """
-    Training function
-    """
-    # Device setup for Apple Silicon (M3 chip)
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using Apple Silicon GPU (MPS)")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("Using NVIDIA GPU (CUDA)")
-    else:
-        device = torch.device("cpu")
-        print("Using CPU")
-    
-    print(f"Using device: {device}")
-    
-    # Initialize tokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    tokenizer.pad_token = tokenizer.eos_token  # GPT-2 doesn't have pad token
-    
-    # Image transforms (same as your CNN training)
-    from torchvision import transforms
+# ---------------------------
+# Main: prepare model & data, train
+# ---------------------------
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # load processors & tokenizers
+    print("[INFO] loading processors & tokenizer")
+    image_processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")  # GPT-2 tokenizer
+
+    # Ensure special tokens exist (gpt2 lacks pad token). We'll add pad and bos/eos if missing.
+    added = False
+    special_tokens = {}
+    if tokenizer.pad_token is None:
+        special_tokens["pad_token"] = "<|pad|>"
+    if tokenizer.bos_token is None:
+        special_tokens["bos_token"] = ""
+    if tokenizer.eos_token is None:
+        special_tokens["eos_token"] = ""
+
+    if len(special_tokens) > 0:
+        tokenizer.add_special_tokens(special_tokens)
+        added = True
+        print(f"[INFO] added special tokens: {special_tokens}")
+
+    # load encoder-decoder model
+    print("[INFO] creating VisionEncoderDecoderModel (ViT encoder + GPT2 decoder)")
+    model = VisionEncoderDecoderModel.from_encoder_decoder_pretrained(
+        "google/vit-base-patch16-224-in21k", "gpt2"
+    )
+
+    # if tokenizer changed size, resize decoder embeddings
+    if added:
+        model.decoder.resize_token_embeddings(len(tokenizer))
+
+    # tie special token ids into config
+    model.config.decoder_start_token_id = tokenizer.bos_token_id or tokenizer.eos_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    # generation config
+    model.config.max_length = GEN_MAX_LENGTH
+    model.config.num_beams = NUM_BEAMS
+
+    model.to(DEVICE)
+
+    # Prepare dataset
+    # use impression as target (clean shorter diagnostic text)
+    if IMPRESSION_COL not in pd.read_csv(CSV_PATH).columns:
+        raise ValueError(f"CSV does not contain column '{IMPRESSION_COL}' — please modify CSV_PATH or IMPRESSION_COL")
+
+    print("[INFO] creating dataset")
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
-    # Create dataset
-    dataset = IndianaXrayDataset(
-        reports_csv=reports_csv_path,
-        images_dir=images_dir,
+
+    full_dataset = IndianaReportDataset(
+        csv_path=CSV_PATH,
+        images_dir=IMAGES_DIR,
+        image_processor=image_processor,
         tokenizer=tokenizer,
-        transform=transform
+        uid_col=UID_COL,
+        text_col=IMPRESSION_COL,
+        max_target_length=MAX_TARGET_LENGTH,
+        transform=None  # use image_processor instead for pixel_values
     )
-    
-    # Split dataset (80% train, 20% val)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-    
-    # Initialize models
-    cnn_extractor = CNNFeatureExtractor(cnn_model_path).to(device)
-    
-    # Determine CNN output dimension
-    with torch.no_grad():
-        dummy_input = torch.randn(1, 3, 224, 224).to(device)
-        cnn_output = cnn_extractor(dummy_input)
-        cnn_feature_dim = cnn_output.size(1)
-        print(f"CNN feature dimension: {cnn_feature_dim}")
-    
-    model = SimpleReportGenerator(
-        cnn_feature_dim=cnn_feature_dim,
-        vocab_size=tokenizer.vocab_size
-    ).to(device)
-    
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    
-    # Training loop
-    model.train()
-    
-    for epoch in range(num_epochs):
-        total_loss = 0
-        num_batches = 0
-        
-        for batch_idx, batch in enumerate(train_loader):
-            images = batch['image'].to(device)
-            input_ids = batch['input_ids'].to(device)
-            
-            # Extract CNN features
-            with torch.no_grad():  # Don't train CNN initially
-                cnn_features = cnn_extractor(images)
-            
-            # Forward pass (teacher forcing)
-            logits = model(cnn_features, input_ids[:, :-1])  # Exclude last token for input
-            targets = input_ids[:, 1:]  # Exclude first token for target
-            
-            # Calculate loss
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                targets.reshape(-1),
-                ignore_index=tokenizer.pad_token_id
-            )
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            total_loss += loss.item()
-            num_batches += 1
-            
-            if batch_idx % 50 == 0:
-                print(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {loss.item():.4f}")
-        
-        scheduler.step()
-        avg_loss = total_loss / num_batches
-        print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
-        
-        # Save checkpoint
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'tokenizer': tokenizer,
-            'loss': avg_loss
-        }, f'report_generator_epoch_{epoch+1}.pth')
-    
-    return model, tokenizer
+
+    # optional debug overfit
+    if DEBUG_OVERFIT:
+        small_idx = list(range(min(OVERFIT_SIZE, len(full_dataset))))
+        small_df = full_dataset.rows.iloc[small_idx].reset_index(drop=True)
+        # write small CSV to memory by creating small dataset object
+        full_dataset.rows = small_df
+        print(f"[DEBUG] Overfit mode enabled: training on {len(full_dataset)} examples")
+
+    # split train / val
+    n = len(full_dataset)
+    indices = list(range(n))
+    random.shuffle(indices)
+    split = int(0.8 * n)
+    train_idx, val_idx = indices[:split], indices[split:]
+
+    train_rows = full_dataset.rows.iloc[train_idx].reset_index(drop=True)
+    val_rows = full_dataset.rows.iloc[val_idx].reset_index(drop=True)
+
+    # create lightweight datasets using the rows DataFrame
+    def make_dataset_from_rows(rows_df):
+        ds = IndianaReportDataset.__new__(IndianaReportDataset)
+        # shallow copy fields required
+        ds.rows = rows_df.reset_index(drop=True)
+        ds.image_processor = image_processor
+        ds.tokenizer = tokenizer
+        ds.max_target_length = MAX_TARGET_LENGTH
+        ds.images_dir = IMAGES_DIR
+        ds.text_col = IMPRESSION_COL
+        ds.uid_col = UID_COL
+        ds.transform = None
+        return ds
+
+    train_ds = make_dataset_from_rows(train_rows)
+    val_ds = make_dataset_from_rows(val_rows)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+
+    # optimizer & scheduler
+    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    num_training_steps = EPOCHS * len(train_loader)
+    lr_scheduler = get_scheduler(
+        "linear",
+        optimizer=optimizer,
+        num_warmup_steps=WARMUP_STEPS,
+        num_training_steps=num_training_steps
+    )
+
+    # training loop
+    best_val_loss = float("inf")
+    for epoch in range(1, EPOCHS + 1):
+        train_loss = train_loop(model, train_loader, optimizer, lr_scheduler, epoch, DEVICE)
+        val_loss, val_examples = eval_loop(model, val_loader, DEVICE, tokenizer)
+
+        print(f"Epoch {epoch} -> train_loss: {train_loss:.4f}, val_loss: {val_loss:.4f}")
+        for uid, pred, ref in val_examples:
+            print(f"[EXAMPLE] uid={uid}")
+            print("  PRED:", pred)
+            print("  REF :", ref[:200])
+
+        # save best
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            model.save_pretrained(OUTPUT_DIR)
+            tokenizer.save_pretrained(OUTPUT_DIR)
+            print(f"[SAVE] saved best model to {OUTPUT_DIR}")
+
+    # Final quick generation demo on a random validation image
+    sample_row = val_rows.sample(1).iloc[0]
+    demo_img = sample_row["img_path"]
+    print(f"\nDemo generation for sample image: {demo_img}")
+    report = generate_report_from_image(model, image_processor, tokenizer, demo_img, DEVICE)
+    print("Generated report:\n", report)
 
 
-# Example usage
 if __name__ == "__main__":
-    # Paths - update these to your actual paths
-    reports_csv_path = "/Users/anishrajumapathy/Downloads/archive-4/indiana_reports.csv"
-    images_dir = "/Users/anishrajumapathy/Downloads/archive-4/images/images_normalized"
-    cnn_model_path = None  # Optional
-    
-    # Train the model
-    model, tokenizer = train_report_generator(
-        reports_csv_path=reports_csv_path,
-        images_dir=images_dir,
-        cnn_model_path=cnn_model_path,
-        num_epochs=20,
-        batch_size=4,  # Start small
-        learning_rate=1e-4
-    )
-    
-    print("Training completed!")
+    main()
